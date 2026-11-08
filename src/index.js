@@ -3,19 +3,26 @@
 // ============================================================
 //
 // WORKFLOW
-// 1. Select the oldest pending email.
-// 2. Retrieve all company_data for its application_id.
-// 3. Ask Sarvam AI whether the email needs a reply
+// 1. Select the oldest pending email whose user is ELIGIBLE:
+//      - user_subscriptions.subscription_status = 'active'
+//      - users.balance >= 0.05
+//    Emails of ineligible users are skipped (left pending).
+// 2. If the email's sender_email matches a lead's email (same user and
+//    application), set that lead's reply_status to "Completed".
+//    If the lead is already Completed, nothing changes.
+//    Then continue with the normal process below.
+// 3. Retrieve all company_data for its application_id.
+// 4. Ask Sarvam AI whether the email needs a reply
 //    (with retries and output cleanup so Sarvam failures are rare).
-// 4. Save the result to Supabase:
-//      reply needed  -> status "draft_created"
-//      no reply      -> status "skipped"
+// 5. Save the result to Supabase:
+//      reply needed  -> status "draft_created"  (0.05 credits charged)
+//      no reply      -> status "skipped"        (no charge)
 //
 // IMPORTANT
 // - Only ONE email per execution.
 // - The status is NEVER changed to "processing" or "failed".
-// - If anything fails, NOTHING is written to the database.
-//   The email simply stays "pending" and is retried next run.
+// - If anything fails, the email stays "pending" and is retried
+//   next run, and any credit charged for it is refunded.
 // - No Gmail API calls. No Composio API calls. Never sends emails.
 //
 // REQUIRED SECRETS
@@ -26,6 +33,9 @@
 // TABLES
 // gmail_processed_messages
 // company_data
+// user_subscriptions
+// users
+// leads
 //
 // ============================================================
 
@@ -36,6 +46,8 @@
 
 const EMAIL_TABLE = "gmail_processed_messages";
 const COMPANY_DATA_TABLE = "company_data";
+const SUBSCRIPTIONS_TABLE = "user_subscriptions";
+const LEADS_TABLE = "leads";
 
 const SARVAM_MODEL = "sarvam-105b";
 const SARVAM_API_URL =
@@ -43,6 +55,20 @@ const SARVAM_API_URL =
 
 // Always process exactly one email per execution.
 const BATCH_SIZE = 1;
+
+// Eligibility / credits.
+const ACTIVE_STATUS = "active";
+const CREDIT_COST = 0.05; // charged per reply draft created
+const USERS_TABLE = "users";
+const USERS_ID_COLUMN = "id";
+const USERS_BALANCE_COLUMN = "balance";
+
+// Lead status set when a lead has replied to us.
+const LEAD_COMPLETED_STATUS = "Completed";
+
+// How many of the oldest pending emails to look at per run.
+const MAX_CANDIDATE_EMAILS = 100;
+const IN_CHUNK_SIZE = 40;
 
 // Sarvam reliability settings.
 const SARVAM_MAX_ATTEMPTS = 3;
@@ -133,31 +159,12 @@ export default {
       }
 
       // ------------------------------------------------------
-      // SELECT ONE OLDEST PENDING EMAIL
+      // SELECT ONE OLDEST PENDING EMAIL FROM AN ELIGIBLE USER
       // ------------------------------------------------------
 
-      const pendingEmails = await supabaseRequest(
-        env,
-        "GET",
-        EMAIL_TABLE,
-        null,
-        {
-          status: "eq.pending",
-          ai_draft_reply: "is.null",
-          should_reply: "is.null",
-          order: "created_at.asc",
-          limit: String(BATCH_SIZE),
-          select: "*",
-        }
-      );
+      const pick = await pickEligibleEmail(env);
 
-      if (!Array.isArray(pendingEmails)) {
-        throw new Error(
-          "Supabase returned an invalid email list."
-        );
-      }
-
-      if (pendingEmails.length === 0) {
+      if (pick.pendingTotal === 0) {
         return jsonResponse(
           {
             ok: true,
@@ -173,7 +180,24 @@ export default {
         );
       }
 
-      const email = pendingEmails[0];
+      if (!pick.email) {
+        return jsonResponse(
+          {
+            ok: true,
+            batch_size: 0,
+            processed: 0,
+            replies_saved: 0,
+            skipped: 0,
+            failed: 0,
+            message: "No eligible emails. Nothing was done.",
+            ...pick.summary,
+          },
+          200,
+          corsHeaders
+        );
+      }
+
+      const email = pick.email;
       const emailId = email.id;
 
       if (!emailId) {
@@ -187,8 +211,8 @@ export default {
         // NO CLAIM STEP
         //
         // The email stays "pending" the whole time. Nothing is
-        // written until the AI result is ready. The final
-        // update below only succeeds if the email is still
+        // written to the email until the AI result is ready. The
+        // final update below only succeeds if the email is still
         // pending, so two overlapping runs cannot overwrite
         // each other.
         // ----------------------------------------------------
@@ -211,6 +235,17 @@ export default {
             "Email is missing email_content."
           );
         }
+
+        // ----------------------------------------------------
+        // LEAD CHECK
+        //
+        // If the sender is one of this application's leads, the
+        // lead has replied: set reply_status to "Completed".
+        // Already Completed leads are left alone. Then the normal
+        // process continues.
+        // ----------------------------------------------------
+
+        const leadUpdate = await markLeadReplied(env, email);
 
         // ----------------------------------------------------
         // LOAD ALL COMPANY KNOWLEDGE
@@ -256,7 +291,7 @@ export default {
         };
 
         // ----------------------------------------------------
-        // CASE 1: NO REPLY REQUIRED
+        // CASE 1: NO REPLY REQUIRED (no credits charged)
         // ----------------------------------------------------
 
         if (aiResult.should_reply === false) {
@@ -310,6 +345,8 @@ export default {
                 should_reply: false,
                 email_category: aiResult.email_category,
                 status: "skipped",
+                lead_update: leadUpdate,
+                credits_charged: 0,
               },
             },
             200,
@@ -319,29 +356,65 @@ export default {
 
         // ----------------------------------------------------
         // CASE 2: REPLY REQUIRED
+        //
+        // Charge 0.05 first (compare-and-swap, so overlapping runs
+        // can't spend the same credit). It is refunded if the draft
+        // is not saved.
         // ----------------------------------------------------
 
-        const savedRows = await supabaseRequest(
+        const charge = await chargeCredits(
           env,
-          "PATCH",
-          EMAIL_TABLE,
-          {
-            should_reply: true,
-            ai_draft_reply: aiResult.reply,
-            gmail_draft_id: null,
-            email_category: aiResult.email_category,
-            status: "draft_created",
-            error_message: null,
-            processed_at: now,
-            updated_at: now,
-          },
-          stillPendingFilter
+          email.user_id,
+          CREDIT_COST
         );
+
+        if (!charge.ok) {
+          return jsonResponse(
+            {
+              ok: true,
+              batch_size: 1,
+              processed: 0,
+              replies_saved: 0,
+              skipped: 0,
+              failed: 0,
+              message:
+                "User no longer has enough credits. Email left pending.",
+            },
+            200,
+            corsHeaders
+          );
+        }
+
+        let savedRows;
+
+        try {
+          savedRows = await supabaseRequest(
+            env,
+            "PATCH",
+            EMAIL_TABLE,
+            {
+              should_reply: true,
+              ai_draft_reply: aiResult.reply,
+              gmail_draft_id: null,
+              email_category: aiResult.email_category,
+              status: "draft_created",
+              error_message: null,
+              processed_at: now,
+              updated_at: now,
+            },
+            stillPendingFilter
+          );
+        } catch (saveError) {
+          await refundCredits(env, email.user_id, CREDIT_COST);
+          throw saveError;
+        }
 
         if (
           !Array.isArray(savedRows) ||
           savedRows.length === 0
         ) {
+          await refundCredits(env, email.user_id, CREDIT_COST);
+
           return jsonResponse(
             {
               ok: true,
@@ -373,6 +446,9 @@ export default {
               status: "draft_created",
               saved_to: "Supabase",
               gmail_draft_id: null,
+              lead_update: leadUpdate,
+              credits_charged: CREDIT_COST,
+              balance: charge.balance,
             },
           },
           200,
@@ -382,9 +458,9 @@ export default {
         // ----------------------------------------------------
         // CASE 3: PROCESSING FAILED
         //
-        // Nothing was written to the database, so the email
-        // is still "pending" and will be retried next run.
-        // The error is only returned in the response and logs.
+        // The email was never changed, so it is still "pending"
+        // and will be retried next run. The error is only
+        // returned in the response and logs.
         // ----------------------------------------------------
 
         const errorMessage = safeErrorMessage(error);
@@ -430,6 +506,384 @@ export default {
     }
   },
 };
+
+
+// ============================================================
+// ELIGIBLE EMAIL SELECTION
+//
+// Looks at the oldest pending emails and returns the oldest one whose
+// user has an active subscription and at least 0.05 credits.
+// Fails closed: if subscriptions or balances can't be read, the run
+// errors out instead of processing anyone.
+// ============================================================
+
+async function pickEligibleEmail(env) {
+  const summary = {
+    emails_considered: 0,
+    skipped_invalid_email_record: 0,
+    skipped_inactive_subscription: 0,
+    skipped_insufficient_credits: 0,
+  };
+
+  // 1. Oldest pending emails (light columns only).
+  const candidates = await supabaseRequest(
+    env,
+    "GET",
+    EMAIL_TABLE,
+    null,
+    {
+      status: "eq.pending",
+      ai_draft_reply: "is.null",
+      should_reply: "is.null",
+      order: "created_at.asc",
+      limit: String(MAX_CANDIDATE_EMAILS),
+      select: "id,user_id,application_id,created_at",
+    }
+  );
+
+  if (!Array.isArray(candidates)) {
+    throw new Error(
+      "Supabase returned an invalid email list."
+    );
+  }
+
+  const pendingTotal = candidates.length;
+
+  if (pendingTotal === 0) {
+    return { email: null, pendingTotal, summary };
+  }
+
+  const usable = [];
+
+  for (const row of candidates) {
+    if (!row.id || !row.user_id || !row.application_id) {
+      summary.skipped_invalid_email_record += 1;
+      continue;
+    }
+
+    usable.push(row);
+  }
+
+  summary.emails_considered = usable.length;
+
+  if (usable.length === 0) {
+    return { email: null, pendingTotal, summary };
+  }
+
+  // 2. Active subscriptions.
+  const userIds = [
+    ...new Set(usable.map((row) => String(row.user_id).toLowerCase())),
+  ];
+
+  const subscriptionRows = await fetchInChunks(
+    env,
+    SUBSCRIPTIONS_TABLE,
+    "user_id",
+    userIds,
+    {
+      select: "user_id,subscription_status",
+      subscription_status: `ilike.${ACTIVE_STATUS}`,
+    }
+  );
+
+  const activeUsers = new Set(
+    subscriptionRows
+      .filter(
+        (row) =>
+          row.user_id &&
+          String(row.subscription_status || "")
+            .trim()
+            .toLowerCase() === ACTIVE_STATUS
+      )
+      .map((row) => String(row.user_id).toLowerCase())
+  );
+
+  const activeUserIds = userIds.filter((id) => activeUsers.has(id));
+
+  // 3. Balances.
+  const balanceRows = activeUserIds.length
+    ? await fetchInChunks(
+        env,
+        USERS_TABLE,
+        USERS_ID_COLUMN,
+        activeUserIds,
+        { select: `${USERS_ID_COLUMN},${USERS_BALANCE_COLUMN}` }
+      )
+    : [];
+
+  const balances = new Map(
+    balanceRows.map((row) => [
+      String(row[USERS_ID_COLUMN]).toLowerCase(),
+      Number(row[USERS_BALANCE_COLUMN]) || 0,
+    ])
+  );
+
+  // 4. Oldest eligible email.
+  let chosenId = null;
+
+  for (const row of usable) {
+    const userId = String(row.user_id).toLowerCase();
+
+    if (!activeUsers.has(userId)) {
+      summary.skipped_inactive_subscription += 1;
+      continue;
+    }
+
+    if ((balances.get(userId) ?? 0) < CREDIT_COST - 1e-9) {
+      summary.skipped_insufficient_credits += 1;
+      continue;
+    }
+
+    chosenId = row.id;
+    break;
+  }
+
+  if (!chosenId) {
+    return { email: null, pendingTotal, summary };
+  }
+
+  // 5. Load the full record for the chosen email only.
+  const full = await supabaseRequest(
+    env,
+    "GET",
+    EMAIL_TABLE,
+    null,
+    {
+      id: `eq.${chosenId}`,
+      status: "eq.pending",
+      ai_draft_reply: "is.null",
+      should_reply: "is.null",
+      select: "*",
+      limit: "1",
+    }
+  );
+
+  if (!Array.isArray(full) || full.length === 0) {
+    // Another run took it in the meantime.
+    return { email: null, pendingTotal, summary };
+  }
+
+  return { email: full[0], pendingTotal, summary };
+}
+
+// Fetches rows where `column` is in `ids`, in chunks so the URL stays short.
+async function fetchInChunks(
+  env,
+  table,
+  column,
+  ids,
+  baseQuery = {}
+) {
+  const rows = [];
+
+  for (let i = 0; i < ids.length; i += IN_CHUNK_SIZE) {
+    const chunk = ids.slice(i, i + IN_CHUNK_SIZE);
+
+    const data = await supabaseRequest(
+      env,
+      "GET",
+      table,
+      null,
+      {
+        ...baseQuery,
+        [column]: `in.(${chunk
+          .map((id) => `"${String(id).replace(/"/g, "")}"`)
+          .join(",")})`,
+      }
+    );
+
+    if (Array.isArray(data)) {
+      rows.push(...data);
+    }
+  }
+
+  return rows;
+}
+
+
+// ============================================================
+// CREDITS
+// ============================================================
+
+const round4 = (n) => Math.round(n * 10000) / 10000;
+
+async function readBalance(env, userId) {
+  const rows = await supabaseRequest(
+    env,
+    "GET",
+    USERS_TABLE,
+    null,
+    {
+      select: USERS_BALANCE_COLUMN,
+      [USERS_ID_COLUMN]: `eq.${userId}`,
+      limit: "1",
+    }
+  );
+
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+
+  return Number(rows[0][USERS_BALANCE_COLUMN]) || 0;
+}
+
+// Compare-and-swap: only applies if the balance is still what we read.
+async function setBalanceIfUnchanged(
+  env,
+  userId,
+  oldBalance,
+  newBalance
+) {
+  const rows = await supabaseRequest(
+    env,
+    "PATCH",
+    USERS_TABLE,
+    { [USERS_BALANCE_COLUMN]: newBalance },
+    {
+      [USERS_ID_COLUMN]: `eq.${userId}`,
+      [USERS_BALANCE_COLUMN]: `eq.${oldBalance}`,
+      select: USERS_BALANCE_COLUMN,
+    }
+  );
+
+  return Array.isArray(rows) && rows.length > 0 ? newBalance : null;
+}
+
+// Deducts `amount`. Returns { ok, balance }.
+async function chargeCredits(env, userId, amount) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const balance = await readBalance(env, userId);
+
+    if (balance === null || balance < amount - 1e-9) {
+      return { ok: false, balance: balance || 0 };
+    }
+
+    const result = await setBalanceIfUnchanged(
+      env,
+      userId,
+      balance,
+      round4(balance - amount)
+    );
+
+    if (result !== null) return { ok: true, balance: result };
+  }
+
+  throw new Error("Could not update credits. Please retry.");
+}
+
+// Gives the credit back (the draft was not saved).
+async function refundCredits(env, userId, amount) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const balance = await readBalance(env, userId);
+      if (balance === null) return;
+
+      const result = await setBalanceIfUnchanged(
+        env,
+        userId,
+        balance,
+        round4(balance + amount)
+      );
+
+      if (result !== null) return;
+    } catch (error) {
+      console.error("Refund error:", safeErrorMessage(error));
+    }
+  }
+
+  console.error("Refund failed after retries for user", userId);
+}
+
+
+// ============================================================
+// LEAD REPLY TRACKING
+//
+// If the email's sender_email matches a lead's email (same user and
+// application, case-insensitive), the lead's reply_status becomes
+// "Completed". Leads that are already Completed are not touched.
+// ============================================================
+
+async function markLeadReplied(env, email) {
+  const senderEmail = extractEmailAddress(email.sender_email);
+
+  if (!senderEmail || !email.user_id || !email.application_id) {
+    return { matched: 0, updated: 0 };
+  }
+
+  const leads = await supabaseRequest(
+    env,
+    "GET",
+    LEADS_TABLE,
+    null,
+    {
+      select: "id,reply_status",
+      application_id: `eq.${email.application_id}`,
+      user_id: `eq.${email.user_id}`,
+      email: `ilike.${escapeLike(senderEmail)}`,
+    }
+  );
+
+  if (!Array.isArray(leads) || leads.length === 0) {
+    return { matched: 0, updated: 0 };
+  }
+
+  const toUpdate = leads.filter(
+    (lead) =>
+      String(lead.reply_status || "").trim().toLowerCase() !==
+      LEAD_COMPLETED_STATUS.toLowerCase()
+  );
+
+  if (toUpdate.length === 0) {
+    // Already Completed: nothing to do.
+    return { matched: leads.length, updated: 0 };
+  }
+
+  const updatedRows = await supabaseRequest(
+    env,
+    "PATCH",
+    LEADS_TABLE,
+    {
+      reply_status: LEAD_COMPLETED_STATUS,
+      updated_at: new Date().toISOString(),
+    },
+    {
+      id: `in.(${toUpdate
+        .map((lead) => `"${String(lead.id).replace(/"/g, "")}"`)
+        .join(",")})`,
+      select: "id",
+    }
+  );
+
+  return {
+    matched: leads.length,
+    updated: Array.isArray(updatedRows) ? updatedRows.length : 0,
+  };
+}
+
+// Accepts "a@b.com" or "Name <a@b.com>" and returns a lowercase address,
+// or null when it isn't a usable email.
+function extractEmailAddress(value) {
+  if (typeof value !== "string") return null;
+
+  const angle = value.match(/<([^>]+)>/);
+  const candidate = (angle ? angle[1] : value).trim().toLowerCase();
+
+  if (
+    candidate.length > 254 ||
+    !/^[^\s@*]+@[^\s@*]+\.[^\s@*]+$/.test(candidate)
+  ) {
+    return null;
+  }
+
+  return candidate;
+}
+
+// Escapes LIKE wildcards so the email is matched exactly (but
+// case-insensitively).
+function escapeLike(value) {
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/%/g, "\\%")
+    .replace(/_/g, "\\_");
+}
 
 
 // ============================================================
